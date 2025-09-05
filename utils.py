@@ -12,7 +12,7 @@ import decord
 from tqdm import tqdm
 from PIL import Image
 from einops import rearrange
-
+import comfy.model_management as mm
 # We need to import the original library functions that our safe wrappers will call.
 from hunyuanvideo_foley.utils.feature_utils import encode_text_feat, encode_video_with_siglip2, encode_video_with_sync
 from hunyuanvideo_foley.utils.config_utils import AttributeDict
@@ -147,35 +147,43 @@ def extract_video_path(video):
 
 @torch.inference_mode()
 def _encode_visual_features_safely(frames_uint8, model_dict, fps_hint):
-    """ Memory-safe visual feature extraction from a list of pre-loaded frames. """
+    """ Memory-safe visual feature extraction using batched preprocessing and inference. """
     dev = model_dict.device
     
-    # Offload other models before starting
-    model_dict.clap_model.to("cpu")
-    model_dict.foley_model.to("cpu")
-    model_dict.dac_model.to("cpu")
+    logger.info("Aggressively clearing VRAM before feature extraction...")
+    import gc
+    mm.unload_all_models(); gc.collect()
     if dev.type == 'cuda': torch.cuda.empty_cache()
     
     visual_features = {}
     pil_list = [Image.fromarray(f).convert("RGB") for f in frames_uint8]
     
+    # Process SigLIP2
     try:
         logger.info("Moving SigLIP2 to device for feature extraction...")
         model_dict.siglip2_model.to(dev)
-        siglip_list = [model_dict.siglip2_preprocess(im) for im in pil_list]
-        clip_frames = torch.stack(siglip_list, dim=0).unsqueeze(0).to(dev)
-        visual_features['siglip2_feat'] = encode_video_with_siglip2(clip_frames, model_dict).to(dev)
+        
+        # Use the batched helper to create the tensor without OOM
+        clip_frames = _batched_frames_to_tensor(pil_list, model_dict.siglip2_preprocess, 16, dev)
+        
+        # Use a safe, fixed batch size for inference, as the smart_batcher is too complex for now.
+        visual_features['siglip2_feat'] = encode_video_with_siglip2(clip_frames, model_dict, batch_size=4).to(dev)
+        del clip_frames
     finally:
         logger.info("Offloading SigLIP2 from device."); model_dict.siglip2_model.to("cpu")
         if dev.type == 'cuda': torch.cuda.empty_cache()
 
+    # Process Syncformer
     try:
         logger.info("Moving Syncformer to device for feature extraction...")
         model_dict.syncformer_model.to(dev)
-        # Correctly preprocess frames for syncformer one by one
-        sync_list = [model_dict.syncformer_preprocess(im) for im in pil_list]
-        sync_frames = torch.stack(sync_list, dim=0).unsqueeze(0).to(dev)
+        
+        # Syncformer's preprocess can often handle a full tensor, but we'll be safe
+        # and use the same batched creation method.
+        sync_frames = _batched_frames_to_tensor(pil_list, model_dict.syncformer_preprocess, 16, dev)
+
         visual_features['syncformer_feat'] = encode_video_with_sync(sync_frames, model_dict)
+        del sync_frames
     finally:
         logger.info("Offloading Syncformer from device."); model_dict.syncformer_model.to("cpu")
         if dev.type == 'cuda': torch.cuda.empty_cache()
@@ -339,3 +347,82 @@ def create_node_exit_values(silent_audio, passthrough_video=None, passthrough_im
     video_path_output = extract_video_path(passthrough_video) if passthrough_video else ""
     
     return (video_path_output, frames_output, audio_output, message)
+
+def smart_encode_video_with_siglip2(clip_frames, model_dict, safety_margin_gb=1.5):
+    device = model_dict.device
+    total_frames = clip_frames.shape[1]
+    
+    # 1. Get Initial Memory State
+    # We must unload everything else first to get a clean measurement.
+    mm.unload_all_models()
+    torch.cuda.empty_cache()
+    
+    # Move the essential model to the GPU
+    model_dict.siglip2_model.to(device)
+    
+    # Measure VRAM *after* the model is loaded.
+    torch.cuda.synchronize() # Wait for move to complete
+    vram_after_model_load = torch.cuda.memory_reserved(device)
+    total_vram = torch.cuda.get_device_properties(device).total_memory
+    available_vram = total_vram - vram_after_model_load
+    safe_vram_budget = available_vram - (safety_margin_gb * 1024**3)
+
+    # 2. Estimate Memory Per Frame
+    # To do this, we process ONE frame to see how much VRAM it uses.
+    # This is our "profiling" step.
+    try:
+        # Measure memory before the forward pass
+        vram_before_profiling_pass = torch.cuda.memory_reserved(device)
+        
+        # Process a single frame
+        _ = model_dict.siglip2_model.get_image_features(pixel_values=clip_frames[:, 0, ...])
+        
+        torch.cuda.synchronize() # Wait for computation to complete
+        vram_after_profiling_pass = torch.cuda.memory_reserved(device)
+        
+        # The memory used is the difference
+        memory_per_frame = vram_after_profiling_pass - vram_before_profiling_pass
+        
+        if memory_per_frame <= 0:
+            # Something went wrong or memory was reused, fall back to a safe default.
+            memory_per_frame = 200 * 1024**2 # Guess: 200MB per frame
+            
+    except Exception as e:
+        # If even one frame OOMs, we can't proceed.
+        logger.error("OOM during profiling pass. Cannot determine memory per frame.")
+        raise e
+
+    # 3. Calculate the Optimal Batch Size
+    if safe_vram_budget > 0 and memory_per_frame > 0:
+        # The number of frames we can fit is our budget divided by the cost per frame.
+        optimal_batch_size = int(safe_vram_budget // memory_per_frame)
+        # Clamp the value to be at least 1 and at most the total number of frames.
+        optimal_batch_size = max(1, min(optimal_batch_size, total_frames))
+    else:
+        # If something went wrong, fall back to a very safe default.
+        optimal_batch_size = 1
+
+    logger.info(f"Smart Batcher: Available VRAM = {available_vram/1024**3:.2f}GB")
+    logger.info(f"Smart Batcher: Memory per frame = {memory_per_frame/1024**2:.2f}MB")
+    logger.info(f"Smart Batcher: Calculated optimal batch size = {optimal_batch_size}")
+    
+    # 4. Run the Standard Batched Inference with the Calculated Batch Size
+    # Now we call the original function, but with our dynamically calculated batch size.
+    return encode_video_with_siglip2(clip_frames, model_dict, batch_size=optimal_batch_size)    
+
+def _batched_frames_to_tensor(pil_list, preprocess_func, batch_size, device):
+    """ Preprocesses and moves frames to device in small batches to save VRAM. """
+    tensor_chunks = []
+    for i in range(0, len(pil_list), batch_size):
+        batch_pil = pil_list[i : i + batch_size]
+        batch_preprocessed = [preprocess_func(im) for im in batch_pil]
+        batch_tensor = torch.stack(batch_preprocessed, dim=0).to(device)
+        tensor_chunks.append(batch_tensor)
+        # Immediately clear the list to save RAM
+        del batch_pil, batch_preprocessed, batch_tensor
+    
+    # Once all chunks are on the device, concatenate them.
+    # This is much more memory-efficient than creating one giant tensor at once.
+    full_tensor = torch.cat(tensor_chunks, dim=0).unsqueeze(0)
+    del tensor_chunks
+    return full_tensor    
