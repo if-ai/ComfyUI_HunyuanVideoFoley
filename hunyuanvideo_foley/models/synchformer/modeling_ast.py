@@ -28,7 +28,21 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, SequenceClassifierOutput
 from transformers.modeling_utils import PreTrainedModel
-from transformers.pytorch_utils import find_pruneable_heads_and_indices, prune_linear_layer
+from transformers.pytorch_utils import prune_linear_layer
+try:
+    from transformers.pytorch_utils import find_pruneable_heads_and_indices
+except ImportError:
+    def find_pruneable_heads_and_indices(
+        heads: Set[int], n_heads: int, head_size: int, already_pruned_heads: Set[int]
+    ) -> Tuple[Set[int], torch.LongTensor]:
+        mask = torch.ones(n_heads, head_size)
+        heads = set(heads) - already_pruned_heads
+        for head in heads:
+            head = head - sum(1 if h < head else 0 for h in already_pruned_heads)
+            mask[head] = 0
+        mask = mask.view(-1).contiguous().eq(1)
+        index: torch.LongTensor = torch.arange(len(mask))[mask].long()
+        return heads, index
 from transformers.models.audio_spectrogram_transformer.modeling_audio_spectrogram_transformer import ASTConfig
 from transformers.utils import (
     add_code_sample_docstrings,
